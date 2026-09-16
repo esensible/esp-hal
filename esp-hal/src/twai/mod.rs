@@ -1535,6 +1535,15 @@ pub trait PrivateInstance: crate::private::Sealed {
     fn unlisten(&mut self, interrupts: impl Into<EnumSet<TwaiInterrupt>>) {
         self.enable_interrupts(interrupts.into(), false);
     }
+
+    /// Re-enables the peripheral interrupt at the interrupt controller.
+    ///
+    /// The async interrupt handler masks it there when the receive queue is
+    /// full and frames have to be left in the hardware FIFO; every poll of an
+    /// async operation re-arms it so that a draining consumer makes progress.
+    fn rearm_interrupt(&self) {
+        crate::interrupt::enable(self.interrupt(), self.async_handler().priority());
+    }
     /// Returns a reference to the asynchronous state for this TWAI instance.
     fn async_state(&self) -> &asynch::TwaiAsyncState;
 }
@@ -1596,7 +1605,11 @@ impl PrivateInstance for crate::peripherals::TWAI0<'_> {
         #[handler]
         fn twai0() {
             let twai = unsafe { crate::peripherals::TWAI0::steal() };
-            asynch::handle_interrupt(twai.register_block(), twai.async_state());
+            asynch::handle_interrupt(
+                twai.register_block(),
+                twai.async_state(),
+                crate::peripherals::Interrupt::TWAI0,
+            );
         }
 
         twai0
@@ -1635,7 +1648,11 @@ impl PrivateInstance for crate::peripherals::TWAI1<'_> {
         #[handler]
         fn twai1() {
             let twai = unsafe { crate::peripherals::TWAI1::steal() };
-            asynch::handle_interrupt(twai.register_block(), twai.async_state());
+            asynch::handle_interrupt(
+                twai.register_block(),
+                twai.async_state(),
+                crate::peripherals::Interrupt::TWAI1,
+            );
         }
 
         twai1
@@ -1772,6 +1789,7 @@ mod asynch {
         ) -> Poll<Self::Output> {
             self.twai.async_state().tx_waker.register(cx.waker());
             self.twai.listen(EnumSet::all());
+            self.twai.rearm_interrupt();
 
             let regs = self.twai.register_block();
             let status = regs.status().read();
@@ -1844,6 +1862,7 @@ mod asynch {
             poll_fn(|cx| {
                 self.twai.async_state().err_waker.register(cx.waker());
                 self.twai.listen(EnumSet::all());
+                self.twai.rearm_interrupt();
 
                 if let Poll::Ready(result) = self.twai.async_state().rx_queue.poll_receive(cx) {
                     return Poll::Ready(result);
@@ -1862,7 +1881,11 @@ mod asynch {
         }
     }
 
-    pub(super) fn handle_interrupt(register_block: &RegisterBlock, async_state: &TwaiAsyncState) {
+    pub(super) fn handle_interrupt(
+        register_block: &RegisterBlock,
+        async_state: &TwaiAsyncState,
+        interrupt: crate::peripherals::Interrupt,
+    ) {
         let int_raw = register_block.int_raw().read();
         let int_ena_reg = register_block.int_ena();
         let int_ena = int_ena_reg.read();
@@ -1887,6 +1910,10 @@ mod asynch {
             }
         }
 
+        // Set when frames had to be left in the receive FIFO because the
+        // queue was full. See where it is read, below.
+        let mut rx_queue_full = false;
+
         if int_raw.rx_int_st().bit_is_set() {
             let status_reg = register_block.status();
             let rx_queue = &async_state.rx_queue;
@@ -1901,18 +1928,20 @@ mod asynch {
             {
                 let msg = if status_reg.read().miss_st().bit_is_set() {
                     // Current frame is incomplete (Rx FIFO has overrun)
-                    release_receive_fifo(register_block);
                     Err(EspTwaiError::EmbeddedHAL(ErrorKind::Overrun))
                 } else {
                     // Current frame is complete
-                    let frame = EspTwaiFrame::new_from_registers(register_block);
-                    release_receive_fifo(register_block);
-                    Ok(frame)
+                    Ok(EspTwaiFrame::new_from_registers(register_block))
                 };
-                // Rx queue is full? Stop consuming Rx frames
+                // Rx queue is full? Stop consuming Rx frames. The receive
+                // buffer is released only once the message has been queued, so
+                // a full queue leaves the frame in the hardware FIFO instead of
+                // silently discarding it.
                 if rx_queue.try_send(msg).is_err() {
+                    rx_queue_full = true;
                     break;
                 }
+                release_receive_fifo(register_block);
             }
         }
 
@@ -1938,6 +1967,21 @@ mod asynch {
         // Clear interrupt request bits
         unsafe {
             int_ena_reg.modify(|_, w| w.bits(int_ena.bits() & (!int_raw.bits() | 1)));
+        }
+
+        if rx_queue_full {
+            // Frames were left in the receive FIFO. The receive interrupt is
+            // level triggered -- it stays asserted until the last received
+            // message is released -- and clearing TWAI_INT_ENA.rx_int_ena
+            // does not deassert the request, so returning here would re-enter
+            // this handler immediately and forever, and no task would ever
+            // run to drain the queue. Mask the peripheral interrupt at the
+            // interrupt controller instead, and wake the waiters: every async
+            // poll calls `rearm_interrupt`, so the interrupt comes back as
+            // soon as the consumer makes progress.
+            crate::interrupt::disable(Cpu::current(), interrupt);
+            async_state.tx_waker.wake();
+            async_state.err_waker.wake();
         }
     }
 }
