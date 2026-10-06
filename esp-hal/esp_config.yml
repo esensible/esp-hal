@@ -52,6 +52,18 @@ options:
       - value: 3740121773
     display_hint: Hex
 
+  - name: twai-rx-queue-size
+    description: "Depth, in frames, of the software queue the async TWAI interrupt
+      handler empties the hardware receive FIFO into. The hardware FIFO holds only
+      about four 8-byte frames, so this queue is what absorbs the time the consumer
+      is not polled: at 500 kbit/s back-to-back 8-byte frames arrive about every
+      250 us, so the default of 32 covers about 8 ms."
+    default:
+      - value: 32
+    constraints:
+      - type:
+          validator: positive_integer
+
   - name: ensure-main-stack-minimum
     description: Prevent successful build if the main stack is smaller than the configured minimum number of bytes.
     default:

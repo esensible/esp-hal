@@ -1536,14 +1536,6 @@ pub trait PrivateInstance: crate::private::Sealed {
         self.enable_interrupts(interrupts.into(), false);
     }
 
-    /// Re-enables the peripheral interrupt at the interrupt controller.
-    ///
-    /// The async interrupt handler masks it there when the receive queue is
-    /// full and frames have to be left in the hardware FIFO; every poll of an
-    /// async operation re-arms it so that a draining consumer makes progress.
-    fn rearm_interrupt(&self) {
-        crate::interrupt::enable(self.interrupt(), self.async_handler().priority());
-    }
     /// Returns a reference to the asynchronous state for this TWAI instance.
     fn async_state(&self) -> &asynch::TwaiAsyncState;
 }
@@ -1605,11 +1597,7 @@ impl PrivateInstance for crate::peripherals::TWAI0<'_> {
         #[handler]
         fn twai0() {
             let twai = unsafe { crate::peripherals::TWAI0::steal() };
-            asynch::handle_interrupt(
-                twai.register_block(),
-                twai.async_state(),
-                crate::peripherals::Interrupt::TWAI0,
-            );
+            asynch::handle_interrupt(twai.register_block(), twai.async_state());
         }
 
         twai0
@@ -1648,11 +1636,7 @@ impl PrivateInstance for crate::peripherals::TWAI1<'_> {
         #[handler]
         fn twai1() {
             let twai = unsafe { crate::peripherals::TWAI1::steal() };
-            asynch::handle_interrupt(
-                twai.register_block(),
-                twai.async_state(),
-                crate::peripherals::Interrupt::TWAI1,
-            );
+            asynch::handle_interrupt(twai.register_block(), twai.async_state());
         }
 
         twai1
@@ -1716,10 +1700,17 @@ mod asynch {
     use super::*;
     use crate::rtc_cntl::WakeLock;
 
+    const RX_QUEUE_SIZE: usize =
+        esp_config::esp_config_int!(usize, "ESP_HAL_CONFIG_TWAI_RX_QUEUE_SIZE");
+
     pub struct TwaiAsyncState {
         pub tx_waker: AtomicWaker,
         pub err_waker: AtomicWaker,
-        pub rx_queue: Channel<RawMutex, Result<EspTwaiFrame, EspTwaiError>, 32>,
+        pub rx_queue: Channel<RawMutex, Result<EspTwaiFrame, EspTwaiError>, RX_QUEUE_SIZE>,
+        /// Frames the handler read and discarded because `rx_queue` was full.
+        pub rx_dropped: portable_atomic::AtomicU32,
+        /// Set with every such discard; the next receive reports it.
+        pub rx_drop_pending: portable_atomic::AtomicBool,
     }
 
     impl Default for TwaiAsyncState {
@@ -1734,6 +1725,8 @@ mod asynch {
                 tx_waker: AtomicWaker::new(),
                 err_waker: AtomicWaker::new(),
                 rx_queue: Channel::new(),
+                rx_dropped: portable_atomic::AtomicU32::new(0),
+                rx_drop_pending: portable_atomic::AtomicBool::new(false),
             }
         }
     }
@@ -1789,7 +1782,6 @@ mod asynch {
         ) -> Poll<Self::Output> {
             self.twai.async_state().tx_waker.register(cx.waker());
             self.twai.listen(EnumSet::all());
-            self.twai.rearm_interrupt();
 
             let regs = self.twai.register_block();
             let status = regs.status().read();
@@ -1857,12 +1849,34 @@ mod asynch {
     }
 
     impl TwaiRx<'_, Async> {
+        /// Frames received but discarded, since the peripheral was set up,
+        /// because the receive queue was full (the consumer was not polled
+        /// for longer than the queue covers; see `ESP_HAL_CONFIG_TWAI_RX_QUEUE_SIZE`).
+        /// Each discard is also reported once by the next [`Self::receive_async`]
+        /// as `ErrorKind::Overrun`.
+        pub fn dropped_frames(&self) -> u32 {
+            self.twai
+                .async_state()
+                .rx_dropped
+                .load(portable_atomic::Ordering::Relaxed)
+        }
+
         /// Receives an `EspTwaiFrame` asynchronously over the TWAI bus.
         pub async fn receive_async(&mut self) -> Result<EspTwaiFrame, EspTwaiError> {
             poll_fn(|cx| {
                 self.twai.async_state().err_waker.register(cx.waker());
                 self.twai.listen(EnumSet::all());
-                self.twai.rearm_interrupt();
+
+                // Frames were discarded because the queue was full: say so
+                // once, before the frames queued after the loss.
+                if self
+                    .twai
+                    .async_state()
+                    .rx_drop_pending
+                    .swap(false, portable_atomic::Ordering::Relaxed)
+                {
+                    return Poll::Ready(Err(EspTwaiError::EmbeddedHAL(ErrorKind::Overrun)));
+                }
 
                 if let Poll::Ready(result) = self.twai.async_state().rx_queue.poll_receive(cx) {
                     return Poll::Ready(result);
@@ -1881,11 +1895,7 @@ mod asynch {
         }
     }
 
-    pub(super) fn handle_interrupt(
-        register_block: &RegisterBlock,
-        async_state: &TwaiAsyncState,
-        interrupt: crate::peripherals::Interrupt,
-    ) {
+    pub(super) fn handle_interrupt(register_block: &RegisterBlock, async_state: &TwaiAsyncState) {
         let int_raw = register_block.int_raw().read();
         let int_ena_reg = register_block.int_ena();
         let int_ena = int_ena_reg.read();
@@ -1910,10 +1920,6 @@ mod asynch {
             }
         }
 
-        // Set when frames had to be left in the receive FIFO because the
-        // queue was full. See where it is read, below.
-        let mut rx_queue_full = false;
-
         if int_raw.rx_int_st().bit_is_set() {
             let status_reg = register_block.status();
             let rx_queue = &async_state.rx_queue;
@@ -1926,22 +1932,48 @@ mod asynch {
                 .bits()
                 > 0
             {
-                let msg = if status_reg.read().miss_st().bit_is_set() {
+                let missed = status_reg.read().miss_st().bit_is_set();
+                let msg = if missed {
                     // Current frame is incomplete (Rx FIFO has overrun)
                     Err(EspTwaiError::EmbeddedHAL(ErrorKind::Overrun))
                 } else {
                     // Current frame is complete
                     Ok(EspTwaiFrame::new_from_registers(register_block))
                 };
-                // Rx queue is full? Stop consuming Rx frames. The receive
-                // buffer is released only once the message has been queued, so
-                // a full queue leaves the frame in the hardware FIFO instead of
-                // silently discarding it.
+                // Rx queue full: the consumer has not been polled for longer
+                // than the queue covers. Discard the frame, count it and flag
+                // it for the consumer's next receive, and keep emptying the
+                // hardware FIFO. Never leave frames in the FIFO: it holds only
+                // about four, so it would overrun at once, and the receive
+                // interrupt is level triggered, so it would have to be masked
+                // to let the consumer run at all.
                 if rx_queue.try_send(msg).is_err() {
-                    rx_queue_full = true;
-                    break;
+                    async_state
+                        .rx_dropped
+                        .fetch_add(1, portable_atomic::Ordering::Relaxed);
+                    async_state
+                        .rx_drop_pending
+                        .store(true, portable_atomic::Ordering::Relaxed);
+                    async_state.err_waker.wake();
                 }
                 release_receive_fifo(register_block);
+                // The overrun's lost messages have all been released: issue
+                // Clear Data Overrun here rather than leave it to the consumer
+                // (which may not run for a while), as ESP-IDF's HAL does
+                // (twai_hal_read_rx_fifo: release, then clear the overrun once
+                // the message count reaches zero).
+                if missed
+                    && register_block
+                        .rx_message_cnt()
+                        .read()
+                        .rx_message_counter()
+                        .bits()
+                        == 0
+                {
+                    register_block
+                        .cmd()
+                        .write(|w| w.clear_data_overrun().set_bit());
+                }
             }
         }
 
@@ -1967,21 +1999,6 @@ mod asynch {
         // Clear interrupt request bits
         unsafe {
             int_ena_reg.modify(|_, w| w.bits(int_ena.bits() & (!int_raw.bits() | 1)));
-        }
-
-        if rx_queue_full {
-            // Frames were left in the receive FIFO. The receive interrupt is
-            // level triggered -- it stays asserted until the last received
-            // message is released -- and clearing TWAI_INT_ENA.rx_int_ena
-            // does not deassert the request, so returning here would re-enter
-            // this handler immediately and forever, and no task would ever
-            // run to drain the queue. Mask the peripheral interrupt at the
-            // interrupt controller instead, and wake the waiters: every async
-            // poll calls `rearm_interrupt`, so the interrupt comes back as
-            // soon as the consumer makes progress.
-            crate::interrupt::disable(Cpu::current(), interrupt);
-            async_state.tx_waker.wake();
-            async_state.err_waker.wake();
         }
     }
 }
