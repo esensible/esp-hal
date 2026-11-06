@@ -65,8 +65,17 @@ enum HciOutType {
     Command,
 }
 
+/// The longest host-to-controller packet the collector takes: indicator +
+/// ACL header (4) + 255 bytes of data, the most the controllers report in LE
+/// Read Buffer Size (the ESP32-C6's NimBLE controller says 255, and hosts
+/// fragment at what it says), and longer than any command (1 + 3 + 255).
+/// It was 256: an ACL packet of more than 251 bytes of data (a 248-byte
+/// notification at ATT MTU 251 is 255 bytes of L2CAP) overran it and
+/// panicked (hilux bench, 2026-11-07).
+const HCI_OUT_MAX: usize = 1 + 4 + 255;
+
 struct HciOutCollector {
-    data: [u8; 256],
+    data: [u8; HCI_OUT_MAX],
     index: usize,
     ready: bool,
     kind: HciOutType,
@@ -75,7 +84,7 @@ struct HciOutCollector {
 impl HciOutCollector {
     fn new() -> HciOutCollector {
         HciOutCollector {
-            data: [0u8; 256],
+            data: [0u8; HCI_OUT_MAX],
             index: 0,
             ready: false,
             kind: HciOutType::Unknown,
@@ -87,6 +96,16 @@ impl HciOutCollector {
     }
 
     fn push(&mut self, data: &[u8]) {
+        if self.index + data.len() > self.data.len() {
+            // longer than any packet a host may send this controller: never
+            // a panic in the host's write path; the packet is dropped whole
+            warn!(
+                "[hci] packet to the controller longer than {} B dropped",
+                self.data.len()
+            );
+            self.reset();
+            return;
+        }
         self.data[self.index..(self.index + data.len())].copy_from_slice(data);
         self.index += data.len();
 
