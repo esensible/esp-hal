@@ -1459,7 +1459,8 @@ unsafe extern "C" fn ble_hs_hci_rx_evt(cmd: *const u8, arg: *const c_void) -> i3
     trace!("$ pld = {:?}", payload);
 
     super::BT_STATE.with(|state| {
-        let mut data = [0u8; 256];
+        // indicator + event code + length + up to 255 bytes of parameters
+        let mut data = [0u8; 258];
 
         data[0] = 0x04; // this is an event
         data[1] = event;
@@ -1482,24 +1483,57 @@ unsafe extern "C" fn ble_hs_hci_rx_evt(cmd: *const u8, arg: *const c_void) -> i3
     0
 }
 
+/// ACL packets the controller handed over as a chain of mbufs (more than one
+/// buffer): diagnostics.
+static CHAINED_ACL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 unsafe extern "C" fn ble_hs_rx_data(om: *const OsMbuf, arg: *const c_void) -> i32 {
     trace!("ble_hs_rx_data {:?} {:?}", om, arg);
 
-    let data_ptr = unsafe { (*om).om_data };
-    let len = unsafe { (*om).om_len };
-    let data_slice = unsafe { core::slice::from_raw_parts(data_ptr, len as usize) };
-
+    // An ACL packet may come as a chain of mbufs (`om_next`): the controller
+    // takes its buffers from two pools, 24 x 320 B and 24 x 128 B, and once the
+    // large one is used up (many packets queued at once) a long packet is
+    // built from several small buffers. Only the first buffer was copied
+    // before, so the packet's ACL header announced more bytes than followed:
+    // bt-hci refused it (`InvalidSize`) and the host's runner stopped, taking
+    // every BLE connection with it until a reset (hilux bench, 2026-11-07,
+    // during a burst of write commands). Copy every buffer of the chain.
     super::BT_STATE.with(|state| {
         let mut data = [0u8; 256];
-
         data[0] = 0x02; // ACL
-        data[1..][..data_slice.len()].copy_from_slice(data_slice);
+        let mut len = 0usize;
+        let mut overflow = false;
+        let mut segments = 0u32;
+        let mut m = om;
+        while !m.is_null() {
+            let seg = unsafe { core::slice::from_raw_parts((*m).om_data, (*m).om_len as usize) };
+            if 1 + len + seg.len() > data.len() {
+                overflow = true;
+                break;
+            }
+            data[1 + len..][..seg.len()].copy_from_slice(seg);
+            len += seg.len();
+            segments += 1;
+            m = unsafe { (*m).next };
+        }
+        if segments > 1 {
+            let n = CHAINED_ACL.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                info!("ble_hs_rx_data: ACL packet in {} mbufs ({} B; {} such so far)", segments, len, n);
+            }
+        }
+        if overflow {
+            // longer than any ACL packet the host takes (4 + 251 B): never
+            // passed on half (it would stop the host's runner)
+            warn!("ble_hs_rx_data: ACL packet longer than {} B dropped", data.len() - 1);
+            return;
+        }
 
         state.rx_queue.push_back(ReceivedPacket {
-            data: Box::from(&data[..data_slice.len() + 1]),
+            data: Box::from(&data[..len + 1]),
         });
 
-        super::dump_packet_info(&data[..(len + 1) as usize]);
+        super::dump_packet_info(&data[..len + 1]);
     });
 
     unsafe {
