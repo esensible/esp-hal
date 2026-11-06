@@ -1523,9 +1523,10 @@ unsafe extern "C" fn ble_hs_rx_data(om: *const OsMbuf, arg: *const c_void) -> i3
             }
         }
         if overflow {
-            // longer than any ACL packet the host takes (4 + 251 B): never
-            // passed on half (it would stop the host's runner)
-            warn!("ble_hs_rx_data: ACL packet longer than {} B dropped", data.len() - 1);
+            // longer than any ACL packet the controller produces (4 + 251 B):
+            // a fault that fails the transport, never passed on half nor
+            // dropped quietly
+            super::hci_fault("an ACL packet from the controller", len);
             return;
         }
 

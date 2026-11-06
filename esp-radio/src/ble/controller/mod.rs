@@ -262,6 +262,9 @@ impl embedded_io_07::ErrorType for HciWriter {
 impl embedded_io_async_07::Write for HciWriter {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         send_hci(buf);
+        if crate::ble::hci_faulted() {
+            return Err(BleConnectorError::Unknown);
+        }
         Ok(buf.len())
     }
 
@@ -306,6 +309,9 @@ impl bt_hci::transport::Transport for BleConnector<'_> {
         let rx = unsafe { &mut *core::ptr::slice_from_raw_parts_mut(rx.as_mut_ptr(), rx.len()) };
 
         let len = next_packet(rx).await;
+        if crate::ble::hci_faulted() {
+            return Err(BleConnectorError::Unknown);
+        }
         parse_hci(&rx[..len])
     }
 

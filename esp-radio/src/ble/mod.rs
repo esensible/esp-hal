@@ -65,13 +65,40 @@ enum HciOutType {
     Command,
 }
 
+/// HCI packets that could not be passed on whole, in either direction, since
+/// boot. Each one is a broken invariant (a packet longer than the controller
+/// or the host can produce), never a quiet drop: it is logged as an error and
+/// the transport fails its next read and write ([`hci_faulted`]), so the
+/// host stops and every connection ends visibly instead of losing a packet
+/// in the middle of a stream.
+static HCI_FAULTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Records a packet that could not be passed on whole (see [`HCI_FAULTS`]).
+pub(crate) fn hci_fault(what: &str, len: usize) {
+    let n = HCI_FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    error!("[hci] {} of {} B could not be passed on whole ({} since boot): the transport fails", what, len, n);
+}
+
+/// Whether a packet was ever lost whole ([`hci_fault`]): the transport fails.
+pub(crate) fn hci_faulted() -> bool {
+    HCI_FAULTS.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// HCI packets that could not be passed on whole since boot (diagnostics).
+#[instability::unstable]
+pub fn hci_faults() -> u32 {
+    HCI_FAULTS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// The longest host-to-controller packet the collector takes: indicator +
 /// ACL header (4) + 255 bytes of data, the most the controllers report in LE
 /// Read Buffer Size (the ESP32-C6's NimBLE controller says 255, and hosts
 /// fragment at what it says), and longer than any command (1 + 3 + 255).
 /// It was 256: an ACL packet of more than 251 bytes of data (a 248-byte
 /// notification at ATT MTU 251 is 255 bytes of L2CAP) overran it and
-/// panicked (hilux bench, 2026-11-07).
+/// panicked (hilux bench, 2026-11-07). A host that fragments at the length
+/// LE Read Buffer Size gives never sends more; one that does is a fault
+/// ([`hci_fault`]), not a drop.
 const HCI_OUT_MAX: usize = 1 + 4 + 255;
 
 struct HciOutCollector {
@@ -97,12 +124,10 @@ impl HciOutCollector {
 
     fn push(&mut self, data: &[u8]) {
         if self.index + data.len() > self.data.len() {
-            // longer than any packet a host may send this controller: never
-            // a panic in the host's write path; the packet is dropped whole
-            warn!(
-                "[hci] packet to the controller longer than {} B dropped",
-                self.data.len()
-            );
+            // longer than any packet a host may send this controller: a
+            // fault that fails the transport, never a panic in the host's
+            // write path nor a quiet drop
+            hci_fault("a packet to the controller", self.index + data.len());
             self.reset();
             return;
         }
